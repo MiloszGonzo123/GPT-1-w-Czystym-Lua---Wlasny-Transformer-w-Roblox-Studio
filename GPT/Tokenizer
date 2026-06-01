@@ -1,0 +1,103 @@
+local Tokenizer = {}
+local Config = require(script.Parent.data)
+
+-- Cache wzorców gsub (Roblox kompiluje je przy każdym wywołaniu)
+local PATTERN_DOT = "%."
+local PATTERN_PUNCT = "[%,%!%?%:%;%\"%(%)%-%_]"
+local PATTERN_WORDS = "%S+"
+
+-- Fallback cache - nie tworzymy nowej tabeli przy każdym GetEmbedding
+local ZERO_VECTOR = {}
+for i = 1, 16 do ZERO_VECTOR[i] = 0.0 end
+
+function Tokenizer.CleanText(text)
+	return string.gsub(string.gsub(string.lower(text), PATTERN_DOT, " . "), PATTERN_PUNCT, "")
+end
+
+function Tokenizer.BuildVocab(raw_text)
+	local cleaned = Tokenizer.CleanText(raw_text)
+	local unique_words = {}
+	local vocab = {}
+	local word_to_id = {}
+	local count = 0
+	for word in string.gmatch(cleaned, PATTERN_WORDS) do
+		if not unique_words[word] then
+			unique_words[word] = true
+			count = count + 1
+			vocab[count] = word
+			word_to_id[word] = count
+		end
+	end
+
+	Config.Vocab = vocab
+	Config.WordToID = word_to_id
+
+	local already_trained = Config.EmbeddingTable and
+		Config.EmbeddingTable[1] and
+		#Config.EmbeddingTable[1] == 16
+
+	if not already_trained then
+		print("[Tokenizer] Brak wag - inicjalizuję losowo")
+		local emb = {}
+		local lm_w = {}
+		local lm_b = {}
+		local rand = math.random
+		for i = 1, count do
+			local e = {}
+			local w = {}
+			for d = 1, 16 do
+				e[d] = (rand() - 0.5) * 0.1
+				w[d] = (rand() - 0.5) * 0.1
+			end
+			emb[i] = e
+			lm_w[i] = w
+			lm_b[i] = 0.0
+		end
+		Config.EmbeddingTable = emb
+		Config.LM_Head = { weights = lm_w, biases = lm_b }
+	else
+		print("[Tokenizer] Wytrenowane wagi zachowane!")
+	end
+
+	print("[Tokenizer] Słownik D=16 wygenerowany. Wielkość: " .. count)
+end
+
+function Tokenizer.GetEmbedding(token_id)
+	local original = Config.EmbeddingTable[token_id]
+	if original then
+		return table.clone(original)
+	end
+	return table.clone(ZERO_VECTOR) -- klonujemy cache zamiast tworzyć nową tabelę
+end
+
+function Tokenizer.Encode(text)
+	local cleaned = Tokenizer.CleanText(text)
+	local tokens = {}
+	local count = 0
+	local word_to_id = Config.WordToID -- lokalna referencja, szybszy dostęp
+	for word in string.gmatch(cleaned, PATTERN_WORDS) do
+		local id = word_to_id[word]
+		if id then
+			count = count + 1
+			tokens[count] = id
+		end
+	end
+	return tokens
+end
+
+function Tokenizer.Decode(token_ids)
+	local vocab = Config.Vocab -- lokalna referencja
+	local final_sentence = {}
+	local count = 0
+	for _, id in ipairs(token_ids) do
+		local word = vocab[id]
+		if word then
+			count = count + 1
+			final_sentence[count] = word
+		end
+	end
+	local output = table.concat(final_sentence, " ")
+	return string.gsub(output, " %.", ".")
+end
+
+return Tokenizer
