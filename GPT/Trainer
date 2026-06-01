@@ -1,0 +1,243 @@
+local Trainer = {}
+
+-- ============================================================
+--  MODUŁY
+-- ============================================================
+local Config      = require(script.Parent.data)
+local Transformer = require(script.Parent.Transformer)
+
+-- ============================================================
+--  STAŁE
+-- ============================================================
+local D           = 16
+local CONTEXT_LEN = 4    -- ile tokenów wstecz bierzemy jako kontekst
+local CLAMP       = 2.0  -- max/min wartość wag
+
+-- ============================================================
+--  SOFTMAX
+-- ============================================================
+local function softmax(logits)
+	local max_logit = -math.huge
+	for i = 1, #logits do
+		if logits[i] > max_logit then max_logit = logits[i] end
+	end
+	if max_logit ~= max_logit then max_logit = 0 end
+
+	local exps = {}
+	local sum  = 0
+	for i = 1, #logits do
+		local ev = math.exp(math.clamp(logits[i] - max_logit, -20, 20))
+		exps[i]  = ev
+		sum      = sum + ev
+	end
+
+	if sum < 1e-9 then sum = 1e-9 end
+	for i = 1, #exps do exps[i] = exps[i] / sum end
+	return exps
+end
+
+-- ============================================================
+--  FORWARD PASS  (zwraca loss, probs, last_vector)
+-- ============================================================
+local ZERO_EMB = table.create(D, 0.0)
+
+local function forwardPass(context_tokens, target_token)
+
+	-- Budujemy sekwencję embeddingów
+	local seq = {}
+	for i = 1, #context_tokens do
+		local emb = Config.EmbeddingTable[context_tokens[i]]
+		local e   = table.create(D, 0.0)
+		if emb then
+			for d = 1, D do e[d] = emb[d] or 0.0 end
+		end
+		seq[i] = e
+	end
+	if #seq == 0 then seq[1] = table.clone(ZERO_EMB) end
+
+	-- Attention
+	local context_vectors = Transformer.ExecuteAttention(seq)
+	local last_vector     = context_vectors[#context_vectors]
+	if not last_vector then last_vector = table.clone(ZERO_EMB) end
+
+	-- Logity LM_Head
+	local lm_weights = Config.LM_Head.weights
+	local lm_biases  = Config.LM_Head.biases
+	local vocab_size = #Config.Vocab
+	local logits     = table.create(vocab_size, 0.0)
+
+	for w_id = 1, vocab_size do
+		local w     = lm_weights[w_id]
+		local score = lm_biases[w_id] or 0.0
+		if w then
+			for d = 1, D do score = score + last_vector[d] * w[d] end
+		end
+		logits[w_id] = score
+	end
+
+	-- Loss
+	local probs       = softmax(logits)
+	local target_prob = math.clamp(probs[target_token] or 0, 1e-15, 1.0)
+	return -math.log(target_prob), probs, last_vector
+end
+
+-- ============================================================
+--  INICJALIZACJA WAG
+-- ============================================================
+local function initWeights(rng)
+	print("[Trainer] Inicjalizacja wag D=" .. D .. "...")
+
+	-- Embeddingi i LM_Head
+	local vocab_size = #Config.Vocab
+	Config.EmbeddingTable        = {}
+	Config.LM_Head               = { weights = {}, biases = {} }
+
+	for w_id = 1, vocab_size do
+		local e = {}
+		local w = {}
+		for d = 1, D do
+			e[d] = rng:NextNumber(-0.1, 0.1)
+			w[d] = rng:NextNumber(-0.1, 0.1)
+		end
+		Config.EmbeddingTable[w_id]        = e
+		Config.LM_Head.weights[w_id]       = w
+		Config.LM_Head.biases[w_id]        = 0.0
+	end
+
+	-- Warstwy attention
+	if not Config.warstwyy then Config.warstwyy = 1 end
+	if not Config.warstwy  then
+		Config.warstwy = {}
+		for i = 1, Config.warstwyy do
+			Config.warstwy["v" .. i] = {}
+		end
+	end
+
+	for _, warstwa in pairs(Config.warstwy) do
+		if type(warstwa.Wq) ~= "table" then
+			warstwa.Wq = {}
+			warstwa.Wk = {}
+			warstwa.Wv = {}
+			warstwa.Wo = {}
+			for d = 1, D do
+				warstwa.Wq[d] = rng:NextNumber(-0.1, 0.1)
+				warstwa.Wk[d] = rng:NextNumber(-0.1, 0.1)
+				warstwa.Wv[d] = rng:NextNumber(-0.1, 0.1)
+				warstwa.Wo[d] = rng:NextNumber(-0.1, 0.1)
+			end
+		end
+		warstwa.Bq = warstwa.Bq or 0.0
+		warstwa.Bk = warstwa.Bk or 0.0
+		warstwa.Bv = warstwa.Bv or 0.0
+		warstwa.Bo = warstwa.Bo or 0.0
+	end
+end
+
+-- ============================================================
+--  BACKPROP
+-- ============================================================
+local function backprop(context_tokens, probs, last_vector, target_token, lr)
+	local lm_weights  = Config.LM_Head.weights
+	local lm_biases   = Config.LM_Head.biases
+	local vocab_size  = #Config.Vocab
+	local ctx_size    = #context_tokens
+	local inv_ctx     = 1 / ctx_size
+
+	-- Gradient wektora kontekstu
+	local d_vector = table.create(D, 0.0)
+
+	-- ── Aktualizacja LM_Head ───────────────────────────────
+	for w_id = 1, vocab_size do
+		local prob    = probs[w_id] or 0
+		local d_logit = (w_id == target_token) and (prob - 1.0) or prob
+
+		-- Bias
+		lm_biases[w_id] = math.clamp(lm_biases[w_id] - lr * d_logit, -CLAMP, CLAMP)
+
+		-- Wagi + akumulacja gradientu
+		local w = lm_weights[w_id]
+		if w then
+			for d = 1, D do
+				d_vector[d] = d_vector[d] + d_logit * w[d]
+				w[d]        = math.clamp(w[d] - lr * d_logit * last_vector[d], -CLAMP, CLAMP)
+			end
+		end
+	end
+
+	-- ── Aktualizacja embeddingów ───────────────────────────
+	for tc = 1, ctx_size do
+		local emb = Config.EmbeddingTable[context_tokens[tc]]
+		if emb then
+			for d = 1, D do
+				emb[d] = math.clamp(emb[d] - lr * d_vector[d] * inv_ctx, -CLAMP, CLAMP)
+			end
+		end
+	end
+
+	-- ── Aktualizacja warstw attention ─────────────────────
+	local att_lr = lr * 0.01
+	for _, warstwa in pairs(Config.warstwy) do
+		for d = 1, D do
+			local g         = d_vector[d]
+			warstwa.Wq[d]   = math.clamp(warstwa.Wq[d] - att_lr * g, -CLAMP, CLAMP)
+			warstwa.Wk[d]   = math.clamp(warstwa.Wk[d] - att_lr * g, -CLAMP, CLAMP)
+			warstwa.Wv[d]   = math.clamp(warstwa.Wv[d] - att_lr * g, -CLAMP, CLAMP)
+			warstwa.Wo[d]   = math.clamp(warstwa.Wo[d] - att_lr * g, -CLAMP, CLAMP)
+		end
+	end
+end
+
+-- ============================================================
+--  GŁÓWNA FUNKCJA TRENINGU
+-- ============================================================
+function Trainer.Train(sentences_batch, epochs, learning_rate)
+
+	initWeights(Random.new(42))
+
+	local log_every = math.max(1, math.floor(epochs / 5))
+
+	for epoch = 1, epochs do
+		local total_loss  = 0
+		local valid_steps = 0
+
+		for _, token_ids in ipairs(sentences_batch) do
+			if #token_ids >= 2 then
+				for i = 2, #token_ids do
+
+					-- Budujemy kontekst (max CONTEXT_LEN tokenów wstecz)
+					local start_idx      = math.max(1, i - CONTEXT_LEN)
+					local context_tokens = {}
+					local c = 0
+					for j = start_idx, i - 1 do
+						c = c + 1
+						context_tokens[c] = token_ids[j]
+					end
+
+					local target_token = token_ids[i]
+					local loss, probs, last_vector = forwardPass(context_tokens, target_token)
+
+					-- Zliczamy tylko prawidłowe kroki
+					if loss == loss and loss ~= math.huge then
+						total_loss  = total_loss + loss
+						valid_steps = valid_steps + 1
+					end
+
+					backprop(context_tokens, probs, last_vector, target_token, learning_rate)
+				end
+			end
+		end
+
+		-- Logowanie co N epok
+		if epoch == 1 or epoch % log_every == 0 then
+			local avg_loss = valid_steps > 0 and (total_loss / valid_steps) or 0
+			print(string.format("[Trainer] Epoka %d/%d | Loss: %.4f", epoch, epochs, avg_loss))
+		end
+
+		task.wait() -- nie blokujemy głównego wątku Roblox
+	end
+
+	print("[Trainer] Trening zakończony!")
+	Config.exportConfigToOutput()
+end
+
+return Trainer
