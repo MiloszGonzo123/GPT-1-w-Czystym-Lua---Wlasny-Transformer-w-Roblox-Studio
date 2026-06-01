@@ -1,1 +1,1 @@
-# -LuaGPT-1-GPT-1-w-Czystym-Lua-W-asny-Transformer-w-Roblox-Studio
+# LuaGPT-1: GPT-1 w Czystym Lua - Wlasny Transformer w Roblox Studio
