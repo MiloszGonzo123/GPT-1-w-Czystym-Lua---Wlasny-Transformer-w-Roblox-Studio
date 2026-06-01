@@ -1,0 +1,193 @@
+local Transformer = {}
+
+-- ============================================================
+--  MODUŁY
+-- ============================================================
+local Config = require(script.Parent.data)
+
+-- ============================================================
+--  STAŁE
+-- ============================================================
+local D        = 16
+local CLAMP_EXP = 20  -- clamp dla math.exp żeby uniknąć inf
+
+-- ============================================================
+--  FEED FORWARD
+-- ============================================================
+local function feedForward(X)
+	local current = X
+	local network = Config.FeedForward
+
+	for l = 1, #network do
+		local layer   = network[l]
+		local weights = layer.weights
+		local biases  = layer.biases
+		local out_size = #biases
+		local in_size  = #current
+		local next    = table.create(out_size, 0.0)
+
+		for i = 1, out_size do
+			local w       = weights[i]
+			local sum     = biases[i]
+			for j = 1, in_size do
+				sum = sum + w[j] * current[j]
+			end
+			-- Sigmoid
+			next[i] = 1 / (1 + math.exp(-sum))
+		end
+
+		current = next
+	end
+
+	return current
+end
+
+-- ============================================================
+--  SELF-ATTENTION  (jedna warstwa)
+-- ============================================================
+local function selfAttention(X, layer_idx)
+	local layer = Config.warstwy["v" .. layer_idx]
+	local N     = #X
+	local Wq, Wk, Wv, Wo = layer.Wq, layer.Wk, layer.Wv, layer.Wo
+	local Bq, Bk, Bv, Bo = layer.Bq or 0, layer.Bk or 0, layer.Bv or 0, layer.Bo or 0
+	local scale = 1 / math.sqrt(D)  -- liczymy raz, nie w każdej iteracji
+
+	-- ── Projekcje Q, K, V ─────────────────────────────────
+	local Q = table.create(N)
+	local K = table.create(N)
+	local V = table.create(N)
+
+	for i = 1, N do
+		local xi  = X[i]
+		local q   = table.create(D)
+		local k   = table.create(D)
+		local v   = table.create(D)
+		for d = 1, D do
+			local x = xi[d]
+			q[d] = x * Wq[d] + Bq
+			k[d] = x * Wk[d] + Bk
+			v[d] = x * Wv[d] + Bv
+		end
+		Q[i] = q
+		K[i] = k
+		V[i] = v
+	end
+
+	-- ── Attention scores (causal / masked) ────────────────
+	local scores = table.create(N)
+
+	for i = 1, N do
+		local qi      = Q[i]
+		local row     = table.create(N, 0.0)
+		local exp_sum = 0
+
+		for j = 1, i do  -- j > i jest maskowane (zostaje 0)
+			local dot = 0
+			local kj  = K[j]
+			for d = 1, D do dot = dot + qi[d] * kj[d] end
+			local e    = math.exp(math.clamp(dot * scale, -CLAMP_EXP, CLAMP_EXP))
+			row[j]     = e
+			exp_sum    = exp_sum + e
+		end
+
+		if exp_sum < 1e-9 then exp_sum = 1e-9 end
+		for j = 1, i do row[j] = row[j] / exp_sum end
+
+		scores[i] = row
+	end
+
+	-- ── Weighted sum → Z ──────────────────────────────────
+	local Z = table.create(N)
+
+	for i = 1, N do
+		local si  = scores[i]
+		local z   = table.create(D)
+		for d = 1, D do
+			local ws = 0
+			for j = 1, i do ws = ws + si[j] * V[j][d] end
+			z[d] = ws * Wo[d] + Bo
+		end
+		Z[i] = z
+	end
+
+	return Z
+end
+
+-- ============================================================
+--  EXECUTE ATTENTION  (wszystkie warstwy + residual)
+-- ============================================================
+function Transformer.ExecuteAttention(X)
+	-- Kopia wejścia żeby nie modyfikować oryginału
+	local seq = table.create(#X)
+	for i = 1, #X do seq[i] = table.clone(X[i]) end
+
+	local num_layers = Config.warstwyy or 1
+
+	for layer_idx = 1, num_layers do
+		local attn_out = selfAttention(seq, layer_idx)
+
+		-- Blok rezydualny: seq = seq + attn_out
+		for row = 1, #seq do
+			local s = seq[row]
+			local a = attn_out[row]
+			for d = 1, D do
+				s[d] = s[d] + a[d]
+			end
+		end
+	end
+
+	return seq
+end
+
+-- ============================================================
+--  LM HEAD  (logity → prawdopodobieństwa)
+-- ============================================================
+function Transformer.LM_Head(logits)
+	local lm         = Config.LM_Head
+	local lm_weights = lm.weights
+	local lm_biases  = lm.biases
+	local vocab_size = #Config.Vocab
+	local outputs    = table.create(vocab_size, 0.0)
+	local max_val    = -math.huge
+
+	for w = 1, vocab_size do
+		local ww  = lm_weights[w]
+		local val = lm_biases[w] or 0
+		if ww then
+			for d = 1, #logits do val = val + ww[d] * logits[d] end
+		end
+		outputs[w] = val
+		if val > max_val then max_val = val end
+	end
+
+	-- Softmax
+	local sum = 0
+	for w = 1, vocab_size do
+		local e    = math.exp(math.clamp(outputs[w] - max_val, -CLAMP_EXP, CLAMP_EXP))
+		outputs[w] = e
+		sum        = sum + e
+	end
+	if sum < 1e-9 then sum = 1e-9 end
+	for w = 1, vocab_size do outputs[w] = outputs[w] / sum end
+
+	return outputs
+end
+
+-- ============================================================
+--  FORWARD  (attention + feed forward dla każdego tokenu)
+-- ============================================================
+function Transformer.Forward(SequenceMatrix)
+	local seq = table.create(#SequenceMatrix)
+	for i = 1, #SequenceMatrix do seq[i] = table.clone(SequenceMatrix[i]) end
+
+	local latent = Transformer.ExecuteAttention(seq)
+
+	local output = table.create(#latent)
+	for i = 1, #latent do
+		output[i] = feedForward(latent[i])
+	end
+
+	return output
+end
+
+return Transformer
