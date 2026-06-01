@@ -1,0 +1,184 @@
+local api = {}
+
+-- ============================================================
+--  MODUŁY
+-- ============================================================
+local Tokenizer  = require(script.Parent.Tokenizer)
+local Trainer    = require(script.Parent.Trainer)
+local Config     = require(script.Parent.data)
+local Transformer = require(script.Parent.Transformer)
+
+-- ============================================================
+--  DANE TRENINGOWE
+-- ============================================================
+local TRAINING_DATA = [[
+    Kot domowy pije smaczne mleko. Mały pies goni szybkiego kota.
+    Czarny pies pije ciepłe mleko. Kot jest mały i czarny.
+    Pies goni kota ponieważ kot pije smaczne mleko.
+    Duży kot śpi na ciepłej macie. Mały pies szczeka głośno.
+    Szary kot je smaczną rybę. Biały pies biega po ogrodzie.
+    Kot pije mleko i je rybę. Pies biega i szczeka głośno.
+    Mały czarny kot śpi spokojnie. Duży biały pies je mięso.
+    Kot jest szybki i zwinny. Pies jest duży i głośny.
+    Stary pies śpi przy ciepłym ogniu. Młody kot bawi się kłębkiem.
+    Głodny kot miauczy cicho. Zmęczony pies leży na macie.
+    Kot i pies śpią razem. Pies i kot piją mleko razem.
+    Mały kot goni mysz. Duży pies pilnuje domu.
+    Czarny kot siedzi na oknie. Brązowy pies leży pod stołem.
+    Ryba jest smaczna dla kota. Kość jest smaczna dla psa.
+    Kot skacze wysoko i zwinnie. Pies biega szybko po trawie.
+    Głodny pies je mięso chętnie. Spragniony kot pije zimne mleko.
+    Mały pies goni szarego kota. Stary kot śpi przy oknie.
+    Pies szczeka bo widzi kota. Kot ucieka bo boi się psa.
+    Biały kot pije ciepłe mleko. Czarny pies goni białego kota.
+    Dom jest duży i ciepły. Ogród jest zielony i duży.
+]]
+
+-- ============================================================
+--  STAŁE
+-- ============================================================
+local D             = 16       -- wymiar embeddingu
+local TEMPERATURE   = 0.8      -- <1 deterministyczny, >1 kreatywny
+local INF           = math.huge
+
+-- ============================================================
+--  INICJALIZACJA SŁOWNIKA I ZDAŃ
+-- ============================================================
+do
+	-- Budujemy słownik na pełnym tekście (bez kropek)
+	local vocab_text = TRAINING_DATA:gsub("%.", "")
+	Tokenizer.BuildVocab(vocab_text)
+end
+
+-- Dzielimy dane na zdania i tokenizujemy każde z nich
+local sentences_table = {}
+for sentence in TRAINING_DATA:gmatch("[^%.]+") do
+	sentence = sentence:match("^%s*(.-)%s*$")
+	if #sentence > 0 then
+		local tokenized = Tokenizer.Encode(sentence)
+		if #tokenized > 0 then
+			table.insert(sentences_table, tokenized)
+		end
+	end
+end
+
+-- ============================================================
+--  POMOCNICZE
+-- ============================================================
+
+-- Zwraca wektor zerowy D-wymiarowy
+local function zeroVector()
+	local vec = table.create(D, 0.0)
+	return vec
+end
+
+-- Zwraca embedding tokenu (kopia, żeby nie modyfikować oryginału)
+local function getEmbedding(token_id)
+	local emb = Config.EmbeddingTable[token_id]
+	if not emb then return zeroVector() end
+	return table.clone(emb)
+end
+
+-- Sprawdza czy wektor zawiera NaN
+local function isValidVector(vec)
+	return vec and vec[1] == vec[1]
+end
+
+-- ============================================================
+--  GENEROWANIE TEKSTU
+-- ============================================================
+function api.WygenerujTekstZKontekstem(prompt, max_steps)
+
+	local input_tokens   = Tokenizer.Encode(prompt)
+	local penalty_factor = Config.repetition_penalty or 1.45
+	local pad_id         = Config.WordToID["<PAD>"]
+	local vocab_size     = #Config.Vocab
+	local lm_weights     = Config.LM_Head.weights
+	local lm_biases      = Config.LM_Head.biases
+
+	for _ = 1, max_steps do
+
+		-- ── 1. Budujemy sekwencję embeddingów ──────────────────
+		local sequence_embeddings = {}
+		for i = 1, #input_tokens do
+			sequence_embeddings[i] = getEmbedding(input_tokens[i])
+		end
+
+		-- ── 2. Przepuszczamy przez attention ───────────────────
+		local context_vectors = Transformer.ExecuteAttention(sequence_embeddings)
+		local last_vector     = context_vectors[#context_vectors]
+
+		if not isValidVector(last_vector) then
+			last_vector = zeroVector()
+		end
+
+		-- ── 3. Zliczamy wystąpienia tokenów (kara za powtórzenia) ──
+		local token_counts = {}
+		for _, tid in ipairs(input_tokens) do
+			token_counts[tid] = (token_counts[tid] or 0) + 1
+		end
+
+		-- ── 4. Obliczamy logity ────────────────────────────────
+		local logits = {}
+		for w_id = 1, vocab_size do
+
+			-- Iloczyn skalarny last_vector · LM_Head.weights[w_id]
+			local w     = lm_weights[w_id]
+			local score = lm_biases[w_id] or 0
+			for d = 1, D do
+				score = score + last_vector[d] * w[d]
+			end
+
+			-- Kara za powtórzenia (rośnie wykładniczo)
+			local count = token_counts[w_id]
+			if count then
+				local penalty = penalty_factor ^ count
+				score = score > 0 and (score / penalty) or (score * penalty)
+			end
+
+			-- Blokujemy token <PAD>
+			if w_id == pad_id then score = -INF end
+
+			logits[w_id] = score / TEMPERATURE
+		end
+
+		-- ── 5. Softmax ─────────────────────────────────────────
+		local max_logit = -INF
+		for w_id = 1, vocab_size do
+			if logits[w_id] > max_logit then max_logit = logits[w_id] end
+		end
+
+		local probs = {}
+		local sum   = 0
+		for w_id = 1, vocab_size do
+			local p     = math.exp(math.clamp(logits[w_id] - max_logit, -20, 20))
+			probs[w_id] = p
+			sum         = sum + p
+		end
+		if sum < 1e-9 then sum = 1e-9 end
+		for w_id = 1, vocab_size do probs[w_id] = probs[w_id] / sum end
+
+		-- ── 6. Weighted sampling ───────────────────────────────
+		local rand       = math.random()
+		local cumulative = 0
+		local chosen     = 1
+		for w_id = 1, vocab_size do
+			cumulative = cumulative + probs[w_id]
+			if rand <= cumulative then
+				chosen = w_id
+				break
+			end
+		end
+
+		table.insert(input_tokens, chosen)
+	end
+
+	return Tokenizer.Decode(input_tokens)
+end
+
+-- ============================================================
+--  TRENING (odkomentuj żeby trenować)
+-- ============================================================
+--Trainer.Train(sentences_table, 600, 0.05, api.WygenerujTekstZKontekstem)
+
+return api
